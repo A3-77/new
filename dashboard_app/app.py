@@ -1133,6 +1133,93 @@ def render_dimension_panel(profile, filters: dict[str, list[str]]) -> None:
         st.markdown(" ".join(dimension_text))
 
 
+def load_overview_sheet(excel_bytes: bytes, sheets: list[str], preferred: list[str]) -> tuple[pd.DataFrame, object] | tuple[pd.DataFrame, None]:
+    for sheet in preferred:
+        if sheet in sheets:
+            df, _schema = cached_sheet(excel_bytes, sheet)
+            return df, build_profile(sheet, df)
+    return pd.DataFrame(), None
+
+
+def sum_matching_metrics(df: pd.DataFrame, keywords: list[str]) -> tuple[float, list[str]]:
+    columns = [
+        column
+        for column in numeric_columns(df)
+        if any(keyword in str(column) for keyword in keywords)
+    ]
+    value = float(sum(aggregate_metric(df, column) for column in columns)) if columns else 0.0
+    return value, columns
+
+
+def overview_dimension(df: pd.DataFrame, profile, semantic: str, keywords: list[str]) -> str | None:
+    column = profile.dimensions.get(semantic) if profile else None
+    if column and column in df.columns:
+        return column
+    return find_col(df, keywords, numeric=False)
+
+
+def overview_metric(df: pd.DataFrame, keywords: list[str]) -> str | None:
+    return find_col(df, keywords, numeric=True)
+
+
+def render_pinned_overview(excel_bytes: bytes, sheets: list[str]) -> None:
+    fee_df, fee_profile = load_overview_sheet(excel_bytes, sheets, ["派费分析报表", "出港考核、派费补贴"])
+    franchise_df, franchise_profile = load_overview_sheet(excel_bytes, sheets, ["总表-加盟商", "加盟商贡献", "总表-网点"])
+    deduction_df = franchise_df if not franchise_df.empty else fee_df
+
+    franchise_col = overview_dimension(fee_df, fee_profile, "加盟商", ["所属加盟商", "加盟商", "结算对象"])
+    if not franchise_col:
+        franchise_col = overview_dimension(franchise_df, franchise_profile, "加盟商", ["所属加盟商", "加盟商", "结算对象"])
+    flow_col = overview_dimension(fee_df, fee_profile, "目的地", ["流向", "返利流向", "目的地", "始发", "寄件方向"])
+    kg_col = overview_dimension(fee_df, fee_profile, "公斤段", ["公斤段", "重量段", "重量明细"])
+    fee_metric = overview_metric(fee_df, ["派费金额", "派费", "派件费", "应付派费", "应收派费", "派费总额"])
+    deduction_total, deduction_cols = sum_matching_metrics(deduction_df, ["扣款", "罚款", "考核扣款", "进港扣款", "出港扣款"])
+
+    fee_total = aggregate_metric(fee_df, fee_metric) if fee_metric else 0.0
+    franchise_count = 0
+    if franchise_col:
+        source = fee_df if franchise_col in fee_df.columns else franchise_df
+        franchise_count = int(source[franchise_col].dropna().astype(str).str.strip().replace("", np.nan).dropna().nunique())
+
+    section_title("总览")
+    with st.container(border=True):
+        kpi_cols = st.columns(4)
+        with kpi_cols[0]:
+            st.metric("加盟商数量", f"{franchise_count:,}")
+            st.caption("维度一：加盟商")
+        with kpi_cols[1]:
+            st.metric("派费金额", fmt_number(fee_total))
+            st.caption(fee_metric or "未识别到派费金额字段")
+        with kpi_cols[2]:
+            st.metric("扣款", fmt_number(deduction_total))
+            st.caption(f"匹配字段 {len(deduction_cols)} 个" if deduction_cols else "未识别到扣款字段")
+        with kpi_cols[3]:
+            st.metric("派费-扣款", fmt_number(fee_total - deduction_total))
+            st.caption("用于汇报口径参考")
+
+        if franchise_col:
+            source_df = fee_df if franchise_col in fee_df.columns else franchise_df
+            options = filter_options(source_df, franchise_col, limit=1000)
+            selected = st.selectbox("加盟商下探", options=options, key="overview_franchise_drill") if options else None
+            drill_df = source_df[source_df[franchise_col].astype(str) == selected] if selected else source_df
+            metric = fee_metric if fee_metric and fee_metric in drill_df.columns else select_core_metric(drill_df, build_profile("总览", drill_df))
+            left, right = st.columns(2)
+            with left:
+                if flow_col and metric and flow_col in drill_df.columns:
+                    table = metric_breakdown_table(drill_df, flow_col, metric, n=12)
+                    compact_bar(table, flow_col, f"{selected or '全部加盟商'} - 流向下探")
+                else:
+                    st.info("当前数据未识别到可下探的流向字段。")
+            with right:
+                if kg_col and metric and kg_col in drill_df.columns:
+                    table = metric_breakdown_table(drill_df, kg_col, metric, n=12)
+                    compact_bar(table, kg_col, f"{selected or '全部加盟商'} - 公斤段下探")
+                else:
+                    st.info("当前数据未识别到可下探的公斤段字段。")
+        else:
+            st.info("当前工作簿未识别到加盟商字段，暂不能生成加盟商下探。")
+
+
 def analysis_frame(df: pd.DataFrame, row_limit: int | None) -> pd.DataFrame:
     if row_limit is None or len(df) <= row_limit:
         return df
@@ -1243,6 +1330,8 @@ def main() -> None:
 
     st.title(sheet_name)
     st.caption(f"数据周期：{page_period(df, profile.dimensions)} | 页面类型：{profile.page_type} | 原始行数：{len(raw_df):,} | 当前行数：{len(df):,}")
+
+    render_pinned_overview(excel_bytes, sheets)
 
     section_title("核心指标 KPI")
     render_kpis(df, profile)
